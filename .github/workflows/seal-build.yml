@@ -1,0 +1,131 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+
+      - name: Go version
+        run: go version && go env
+
+      - name: Produce module zip
+        run: |
+          set -euo pipefail
+          # Pack from a copy of the tree without this seal workflow, so the
+          # module zip keeps the public member set (upstream ships no .github).
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/zipper"
+          rsync -a --exclude .git ./ "$RUNNER_TEMP/modsrc/"
+          rm -f "$RUNNER_TEMP/modsrc/.github/workflows/seal-build.yml"
+          find "$RUNNER_TEMP/modsrc/.github" -depth -type d -empty -delete
+          cat > "$RUNNER_TEMP/zipper/main.go" <<'EOF'
+          package main
+
+          import (
+          	"log"
+          	"os"
+
+          	"golang.org/x/mod/module"
+          	"golang.org/x/mod/zip"
+          )
+
+          func main() {
+          	m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+          	f, err := os.Create(os.Args[4])
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer f.Close()
+          	if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+          		log.Fatal(err)
+          	}
+          	log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/zipper"
+          go mod init example.com/zipper
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.28.0
+          mkdir -p "$RUNNER_TEMP/build_output"
+          GOFLAGS=-mod=mod go run . golang.org/x/net v0.45.0 "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/build_output/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/build_output/v0.45.0.zip" | tail -3
+
+      - name: Build
+        run: go build ./...
+
+      - name: Prepare network environment for socket tests
+        run: |
+          # ipv4/ipv6/icmp tests need IPv6 on loopback, a multicast-capable
+          # loopback, and unprivileged ICMP sockets allowed.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          sudo ip link set lo multicast on
+          # nettest.RoutedInterface ignores ::1, so give lo a routable (ULA) address.
+          sudo ip -6 addr add fd00:5ea1::1/128 dev lo
+          # Route multicast through lo and accept loopback-sourced looped-back
+          # multicast (source-specific group test uses src 127.0.0.1).
+          sudo ip route replace 224.0.0.0/4 dev lo
+          sudo ip -6 route replace ff00::/8 dev lo metric 1
+          for k in all default lo; do
+            sudo sysctl -w net.ipv4.conf.$k.route_localnet=1
+            sudo sysctl -w net.ipv4.conf.$k.rp_filter=0
+          done
+          ip addr show lo
+          ip route show; ip -6 route show
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          # Test binaries run as root (compilation stays unprivileged) so the
+          # raw-socket tests in ipv4/ipv6/icmp/route are exercised.
+          if [ -n "$TEST_FILTER" ]; then
+            go test -timeout 5m -exec sudo -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/test.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -timeout 5m -exec sudo -v ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/test.log"
+          echo "=== Package results ==="
+          awk '/^(ok|FAIL|\?)[ \t]/' "$log"
+          echo "=== Skipped tests (name + reason) ==="
+          # go test -v prints t.Skip messages between "=== RUN" and "--- SKIP".
+          awk '/^=== (RUN|CONT|PAUSE)/{buf=""; next}
+               /^[ \t]*--- SKIP/{print; if (buf != "") printf "%s", buf; buf=""; next}
+               /^[ \t]+[A-Za-z0-9_]+\.go:[0-9]+:/{buf=buf "      reason: " $0 "\n"}' "$log"
+          echo "=== Totals ==="
+          echo "PASSED tests (incl. subtests): $(grep -cE '^\s*--- PASS' "$log")"
+          echo "FAILED tests (incl. subtests): $(grep -cE '^\s*--- FAIL' "$log")"
+          echo "SKIPPED tests (incl. subtests): $(grep -cE '^\s*--- SKIP' "$log")"
+          echo "Packages ok: $(grep -cE '^ok\s' "$log")"
+          echo "Packages FAIL: $(grep -cE '^FAIL\s' "$log")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
